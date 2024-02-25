@@ -10,15 +10,12 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None
-
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
-except ImportError:
-    selective_scan_fn, mamba_inner_fn = None, None, None
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -165,16 +162,18 @@ class Mamba(nn.Module):
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
             if conv_state is not None:
-                conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
+                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
-                    x,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
+                    x=x,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
                 )
 
             # We're careful here about the layout, to avoid extra transposes.
